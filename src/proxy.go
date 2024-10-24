@@ -9,16 +9,19 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
-var targetServer string
+var (
+	targetServer   string
+	headers        map[string]string
+	shouldColorize bool
+)
 
-func ProxyHandler(w http.ResponseWriter, r *http.Request) {
-	log.Printf("Requested URL: %s", r.URL)
-	log.Printf("Will forward to %s", targetServer)
+func proxyHandler(w http.ResponseWriter, r *http.Request) {
+	rqTime := time.Now()
 
 	target, err := url.Parse(targetServer)
-	log.Printf("Connecting to: %s", r.URL)
 	if err != nil {
 		http.Error(w, "Could not parse the target URL", http.StatusInternalServerError)
 		return
@@ -27,8 +30,6 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 	// Preserve the original path and query parameters using RawQuery
 	target.Path = r.URL.Path
 	target.RawQuery = r.URL.RawQuery // Copy query parameters as is
-
-	log.Printf("%s %s %s\n", r.RemoteAddr, r.Method, target)
 
 	// Create a new request to the target server
 	req, err := http.NewRequest(r.Method, target.String(), r.Body)
@@ -42,10 +43,22 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set(k, v[0])
 	}
 
-	// As needed, add custom headers from the proxy intended for the target server
-	// req.Header.Set("Via", "1.0 go-proxligithub.com/osuritz/go-proxli")
-	// req.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	req.Header.Set("Via", "go-proxli/0.1")
+	ip, err := getRemoteIP(r)
+	if err == nil {
+		req.Header.Set("X-Forwarded-For", ip)
+	} else {
+		log.Printf("Error obtaining remote IP: %v\n", err)
+	}
 
+	if len(headers) > 0 {
+		for k, v := range headers {
+			req.Header.Set(k, v)
+		}
+	}
+
+	// As needed, add custom headers from the proxy intended for the target
+	// server. E.g.
 	// req.Header.Set("x-foo-header", "my-bar-value")
 
 	// Make the request to the target server
@@ -61,21 +74,49 @@ func ProxyHandler(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set(k, v[0])
 	}
 	w.WriteHeader(resp.StatusCode)
-	io.Copy(w, resp.Body)
+	bytesWritten, err := io.Copy(w, resp.Body)
+	if err != nil {
+		bytesWritten = -1
+	}
+
+	fmt.Println(getCLFEntry(rqTime, r, resp, bytesWritten,
+		/* client-id */ "-",
+		/* user-id */ "-",
+		shouldColorize))
 }
 
 func main() {
 	var (
-		listenPort = flag.Int("port", 8080, "Incoming port")
-		tsFlag = flag.String("target", "", "Target server")
+		listenPort                     = flag.Int("port", 8080, "Incoming port")
+		tsFlag                         = flag.String("target", "", "Target server")
+		noColor                        = flag.Bool("noColor", false, "Disable colorized output")
+		extraHeaders map[string]string = make(map[string]string)
 	)
 
+	// Register the `--header` flag(s) with a custom func to collect multiple values
+	flag.Func("header", "Additional header to be sent to the target server", func(h string) error {
+		tokens := strings.Split(h, ":")
+		if len(tokens) != 1 && len(tokens) != 2 {
+			return fmt.Errorf("invalid error format: %s", h)
+		}
+		if len(tokens) == 1 {
+			extraHeaders[strings.TrimSpace(tokens[0])] = ""
+		} else {
+			extraHeaders[strings.TrimSpace(tokens[0])] = strings.TrimSpace(tokens[1])
+		}
+		return nil
+	})
+
 	flag.Usage = func() {
-		fmt.Println("Usage: proxy [-port <port>] [-target <server>]")
+		fmt.Println("Usage: proxy [-port <port>] [-target <server>] [--noColor] [--header '<name>: <value>']")
 		flag.PrintDefaults()
 	}
 
 	flag.Parse()
+	localAddr := fmt.Sprintf("localhost:%d", *listenPort)
+	log.Printf("Starting go-proxli on %s...", localAddr)
+
+	shouldColorize = !*noColor
 
 	if *tsFlag == "" {
 		log.Println("Target server must be specified")
@@ -93,20 +134,17 @@ func main() {
 		log.Fatalf("Error: could not parse target URL: %v\n", err)
 	}
 
-
-
-	// if target.Scheme == "" {
-	// 	target, err = url.Parse(fmt.Sprintf("http://%s", *tsFlag))
-	// 	log.Printf("Target is now %s", target.String())
-	// 	if err != nil {
-	// 		log.Fatalf("Error: could not parse target URL: %v\n", err)
-	// 	}
-	// }
 	targetServer = target.String()
 
-	log.Printf("Starting proxy on port: %d, targeting %s\n", *listenPort, targetServer)
+	// Copy the extra headers to the global headers map
+	headers = extraHeaders
 
-	http.HandleFunc("/", ProxyHandler)
+	format := "[go-proxli] Running on http://%s → %s\n"
+	if !*noColor {
+		format = "[go-proxli] Running on " + ColorCyanNormal("http://%s") + " → " + ColorCyanBright("http://%s") + "\n"
+	}
+	log.Printf(format, localAddr, targetServer)
 
-	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *listenPort), nil))
+	http.HandleFunc("/", proxyHandler)
+	log.Fatal(http.ListenAndServe(localAddr, nil))
 }
